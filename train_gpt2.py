@@ -150,17 +150,17 @@ def rule(ys):
 
 # DEFINE THE MODEL
 mlps = [
-    # RegularMLP(cfg)
-    ExpandedMLP(
-        d_model,
-        cfg.mlp_dims,
-        n_dims_expand,
-        masking_is_param_level=True,
-        expanded_dim_lr_forget=1.0,
-        expanded_dim_lr_retain=1.0,
-        original_dim_lr_forget=0.0,
-        original_dim_lr_retain=1.0,
-    )
+    RegularMLP(cfg)
+    # ExpandedMLP(
+    #    d_model,
+    #    cfg.mlp_dims,
+    #    n_dims_expand,
+    #    masking_is_param_level=True,
+    #    expanded_dim_lr_forget=1.0,
+    #    expanded_dim_lr_retain=1.0,
+    #    original_dim_lr_forget=0.0,
+    #    original_dim_lr_retain=1.0,
+    # )
     for _ in range(n_layers)
 ]
 attns = [CausalGroupedSelfAttention(cfg) for _ in range(n_layers)]

@@ -433,6 +433,61 @@ class RegularMLP(nn.Module):
         return self.c_fc.weight.abs().sum() + self.c_fc.bias.abs().sum()
 
 
+@dataclass
+class MLPOrResidualMaskConfig:
+    dimensions: list[int]
+    pos_lr: float
+    neg_lr: float
+
+
+class DiscreteMaskingMLP(nn.Module):
+    def __init__(self, config, mask_cfgs: list[MLPOrResidualMaskConfig]):
+        super().__init__()
+        expanded_size = config.mlp_dims
+        self.c_fc = nn.Linear(config.n_embd, expanded_size, bias=True)
+        self.c_proj = nn.Linear(expanded_size, config.n_embd, bias=True)
+        mask = torch.empty((len(mask_cfgs), expanded_size), requires_grad=False)
+        for i, mask_cfg in enumerate(mask_cfgs):
+            mask[i] = torch.full((expanded_size,), mask_cfg.neg_lr)
+            mask[i][mask_cfg.dimensions] = mask_cfg.pos_lr
+        ablate_mask = torch.ones((len(mask_cfgs), expanded_size), requires_grad=False)
+        for i, mask_cfg in enumerate(mask_cfgs):
+            ablate_mask[i][mask_cfg.dimensions] = 0.0
+        self.register_buffer("mask", mask)
+        self.register_buffer("ablate_mask", ablate_mask)
+
+    def forward(self, x, tok_masks: Int[torch.Tensor, "batch seq"]):
+        x = self.c_fc(x)
+        x = F.gelu(x)
+
+        if tok_masks is not None:
+            mask = self.mask[tok_masks]
+            x = x * mask + (1.0 - mask) * x.detach()
+
+        x = self.c_proj(x)
+        return x, torch.tensor(0.0, device=x.device)
+
+    def forward_ablated(self, x):
+        x = self.c_fc(x)
+        x = F.gelu(x)
+        x = x * self.ablate_mask[0]
+        x = self.c_proj(x)
+        return x
+
+    def contract(self) -> RegularMLP:
+        Config = namedtuple("Cfg", ["n_embd", "mlp_dims"])
+        contracted_n_expanded = self.ablate_mask[0].sum().int()
+        cfg = Config(self.c_fc.weight.size(1), contracted_n_expanded)
+        new_mlp = RegularMLP(cfg)
+        with torch.no_grad():
+            new_mlp.c_fc.weight[:] = self.c_fc.weight[self.ablate_mask[0] == 1]
+            new_mlp.c_fc.bias[:] = self.c_fc.bias[self.ablate_mask[0] == 1]
+            new_mlp.c_proj.weight[:] = self.c_proj.weight[:, self.ablate_mask[0] == 1]
+            new_mlp.c_proj.bias[:] = self.c_proj.bias
+
+        return new_mlp
+
+
 class ExpandedMLP(nn.Module):
     def __init__(
         self,
