@@ -10,6 +10,8 @@ import transformers
 from model import (
     Config,
     ExpandedMLP,
+    MLPOrResidualMaskConfig,
+    DiscreteMaskingMLP,
     RegularMLP,
     CausalGroupedSelfAttention,
     Block,
@@ -22,12 +24,11 @@ from dataloader import DistributedDataLoader
 import evals
 
 gradient_accumulation_steps = 48
-# TODO update to hyperparams from NanoGPT
 lr = 1e-3
 cooldown_frac = 0.4
 wandb_log = True
 grad_clip = 1.0
-batch_size = 8
+batch_size = 12
 block_size = 1024
 tokens_per_batch = batch_size * gradient_accumulation_steps * block_size
 print("tokens per batch:", tokens_per_batch)
@@ -151,6 +152,13 @@ def rule(ys):
 # DEFINE THE MODEL
 mlps = [
     RegularMLP(cfg)
+    # DiscreteMaskingMLP(
+    #    cfg,
+    #    [
+    #        MLPOrResidualMaskConfig(list(range(64)), 1.0, 0),
+    #        MLPOrResidualMaskConfig(list(range(d_model)), 1.0, 1.0),
+    #    ],
+    # )
     # ExpandedMLP(
     #    d_model,
     #    cfg.mlp_dims,

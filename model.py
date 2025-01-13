@@ -461,7 +461,7 @@ class DiscreteMaskingMLP(nn.Module):
         x = F.gelu(x)
 
         if tok_masks is not None:
-            mask = self.mask[tok_masks]
+            mask = self.mask[tok_masks.long()]
             x = x * mask + (1.0 - mask) * x.detach()
 
         x = self.c_proj(x)
