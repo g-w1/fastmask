@@ -514,8 +514,9 @@ class ExpandedMLP(nn.Module):
             if mask_ids is None:
                 mask_ids = torch.zeros((x.size(0), x.size(1)), device=x.device)
             original_lrs = (
-                1 - mask_ids
-            ) * self.original_dim_lr_retain + mask_ids * self.original_dim_lr_forget
+                mask_ids * self.original_dim_lr_retain
+                + (1 - mask_ids) * self.original_dim_lr_forget
+            )
             expanded_lrs = (
                 1 - mask_ids
             ) * self.expanded_dim_lr_retain + mask_ids * self.expanded_dim_lr_forget

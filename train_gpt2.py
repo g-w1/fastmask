@@ -7,6 +7,7 @@ import tqdm
 from torch.distributed import init_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 import transformers
+from dotenv import load_dotenv
 from model import (
     Config,
     ExpandedMLP,
@@ -28,7 +29,7 @@ lr = 1e-3
 cooldown_frac = 0.4
 wandb_log = True
 grad_clip = 1.0
-batch_size = 12
+batch_size = 6
 block_size = 1024
 tokens_per_batch = batch_size * gradient_accumulation_steps * block_size
 print("tokens per batch:", tokens_per_batch)
@@ -151,7 +152,17 @@ def rule(ys):
 
 # DEFINE THE MODEL
 mlps = [
-    RegularMLP(cfg)
+    # RegularMLP(cfg)
+    ExpandedMLP(
+        d_model,
+        cfg.mlp_dims,
+        n_dims_expand,
+        masking_is_param_level=True,
+        expanded_dim_lr_forget=1.0,
+        expanded_dim_lr_retain=1.0,
+        original_dim_lr_forget=0.0,
+        original_dim_lr_retain=1.0,
+    )
     # DiscreteMaskingMLP(
     #    cfg,
     #    [
@@ -159,17 +170,9 @@ mlps = [
     #        MLPOrResidualMaskConfig(list(range(d_model)), 1.0, 1.0),
     #    ],
     # )
-    # ExpandedMLP(
-    #    d_model,
-    #    cfg.mlp_dims,
-    #    n_dims_expand,
-    #    masking_is_param_level=True,
-    #    expanded_dim_lr_forget=1.0,
-    #    expanded_dim_lr_retain=1.0,
-    #    original_dim_lr_forget=0.0,
-    #    original_dim_lr_retain=1.0,
-    # )
-    for _ in range(n_layers)
+    if i < 5
+    else RegularMLP(cfg)
+    for i in range(n_layers)
 ]
 attns = [CausalGroupedSelfAttention(cfg) for _ in range(n_layers)]
 blocks = [Block(cfg, attn, mlp) for mlp, attn in zip(mlps, attns)]
@@ -215,7 +218,11 @@ val_dataloader = DistributedDataLoader(
 optim = model.configure_optimizers(0.1, lr, (0.9, 0.95), device)
 
 if master_process and wandb_log:
+    load_dotenv()
+    api_key = os.environ.get("WANDB_API_KEY")
+    wandb.login(key=api_key)
     wandb.init(project="fastmask", name="fastmask")
+    wandb.run.log_code(".", include_fn=lambda path: path.endswith(".py"))
 else:
     wandb_log = False
 
