@@ -8,7 +8,7 @@ from torch.distributed import init_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 import transformers
 from dotenv import load_dotenv
-from fastmask.model import (
+from fm.model import (
     Config,
     ExpandedMLP,
     MLPOrResidualMaskConfig,
