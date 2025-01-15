@@ -8,7 +8,7 @@ from torch.distributed import init_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 import transformers
 from dotenv import load_dotenv
-from model import (
+from fastmask.model import (
     Config,
     ExpandedMLP,
     MLPOrResidualMaskConfig,
@@ -154,10 +154,9 @@ def rule(ys):
 mlps = [
     # RegularMLP(cfg)
     ExpandedMLP(
-        d_model,
-        cfg.mlp_dims,
+        cfg,
         n_dims_expand,
-        masking_is_param_level=True,
+        masking_is_param_level=False,
         expanded_dim_lr_forget=1.0,
         expanded_dim_lr_retain=1.0,
         original_dim_lr_forget=0.0,
@@ -170,12 +169,12 @@ mlps = [
     #        MLPOrResidualMaskConfig(list(range(d_model)), 1.0, 1.0),
     #    ],
     # )
-    if i < 5
+    if i < 9
     else RegularMLP(cfg)
     for i in range(n_layers)
 ]
 attns = [CausalGroupedSelfAttention(cfg) for _ in range(n_layers)]
-blocks = [Block(cfg, attn, mlp) for mlp, attn in zip(mlps, attns)]
+blocks = [Block(cfg, attn, mlp) for attn, mlp in zip(attns, mlps)]
 embd = Embd(cfg)
 unembd = UnEmbd(cfg)
 if cfg.tie_weights:
@@ -185,7 +184,7 @@ model.to(device)
 
 
 print("compiling the model... (takes a ~minute)")
-# TODO I need to set to 128 for ExpandedMLP, but it's still slow!
+# I need to set to 128 for ExpandedMLP, since it recompiles it a bunch
 torch._dynamo.config.cache_size_limit = 128
 
 model: torch.nn.Module = torch.compile(model)  # type: ignore
@@ -248,9 +247,9 @@ for iter_num in pbar:
             ddp_model.require_backward_grad_sync = (
                 micro_step == gradient_accumulation_steps - 1
             )
-        tok_masks = rule(Y)
+        mask_ids = rule(Y)
         with ctx:
-            logits, aux_loss, lm_loss = ddp_model(X, Y, tok_masks)
+            logits, aux_loss, lm_loss = ddp_model(X, Y, mask_ids)
             loss = lm_loss + aux_loss
             loss /= gradient_accumulation_steps
         los += lm_loss.item() / gradient_accumulation_steps

@@ -69,8 +69,6 @@ class RoutedLinear(Function):
 routed_linear = RoutedLinear.apply
 
 # TESTS
-
-
 # TODO test with pytest instead
 if __name__ == "__main__":
 

@@ -5,7 +5,7 @@ import math
 from collections import namedtuple
 from dataclasses import dataclass
 from typing import Optional
-from param_level_masking import RoutedLinear as RoutedLinearFn
+from .param_level_masking import RoutedLinear as RoutedLinearFn
 
 import torch
 import torch.nn as nn
@@ -93,13 +93,7 @@ class CausalGroupedSelfAttention(nn.Module):
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.attn_bias)
 
-    def doubled_retain_params(self) -> list:
-        return []
-
-    def doubled_forget_params(self) -> list:
-        return []
-
-    def forward(self, x, tok_masks):
+    def forward(self, x, mask_ids):
         B, T, C = x.size()
 
         q = self.c_attn_q(x).view(B, T, self.n_head, self.d_head).transpose(1, 2)
@@ -175,18 +169,6 @@ class RoutedTransformer(nn.Module):
                     # https://github.com/KellerJordan/modded-nanogpt/blob/e48427208f14a0a27ef0fcf2d369a0f4299342d7/train_gpt.py#L249
                     p.data.zero_()
 
-    def doubled_retain_params(self) -> list:
-        retain_params = []
-        for block in self.transformer.blocks:
-            retain_params.extend(block.doubled_retain_params())
-        return retain_params
-
-    def doubled_forget_params(self) -> list:
-        forget_params = []
-        for block in self.transformer.blocks:
-            forget_params.extend(block.doubled_forget_params())
-        return forget_params
-
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
@@ -238,8 +220,8 @@ class RoutedTransformer(nn.Module):
             )
         return logits, lm_loss
 
-    # TODO deal with the fact that we want to decay based on how much it was used / it's gradients
-    # Look into how MOEs do this
+    # TODO deal with the fact that we might want to decay params based on how much stuff actually routed through them
+    # Maybe look into how MOEs do this
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         # start with all of the candidate parameters
         param_dict = {pn: p for pn, p in self.named_parameters()}
@@ -288,8 +270,10 @@ class RoutedTransformer(nn.Module):
             contracted_blocks,
         )
         new_routed_transformer.transformer.ln_f = contract_module(self.transformer.ln_f)
+        new_routed_transformer.to(next(iter(self.parameters())).device)
         return new_routed_transformer
 
+    # TODO look into speeding this up with KV cache but it's not a bottleneck right now
     @torch.no_grad()
     def generate(self, prompt_tokenized, max_new_toks, temperature):
         device = next(iter(self.parameters())).device
@@ -327,12 +311,6 @@ class Block(nn.Module):
         mlp_out, aux_loss_mlp = self.mlp(self.rmsnorm_2(x), mask_ids)
         x = x + mlp_out
         return x, aux_loss_attn + aux_loss_mlp
-
-    def doubled_retain_params(self) -> list:
-        return self.attn.doubled_retain_params() + self.mlp.doubled_retain_params()
-
-    def doubled_forget_params(self) -> list:
-        return self.attn.doubled_forget_params() + self.mlp.doubled_forget_params()
 
     def forward_ablated(self, x):
         attn_out = self.attn.forward_ablated(self.rmsnorm_1(x))
@@ -405,11 +383,12 @@ class RoutedLinear(nn.Module):
 class RegularMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
+        self.config = config
         expanded_size = config.mlp_dims
         self.c_fc = nn.Linear(config.n_embd, expanded_size, bias=True)
         self.c_proj = nn.Linear(expanded_size, config.n_embd, bias=True)
 
-    def forward(self, x, tok_masks):
+    def forward(self, x, mask_ids):
         x = self.c_fc(x)
         x = F.gelu(x)
         x = self.c_proj(x)
@@ -423,10 +402,11 @@ class RegularMLP(nn.Module):
 
     def contract(self) -> "RegularMLP":
         contracted = RegularMLP(self.config)
-        contracted.c_fc.weight[:] = self.c_fc.weight[:]
-        contracted.c_fc.bias[:] = self.c_fc.bias[:]
-        contracted.c_proj.weight[:] = self.c_proj.weight[:]
-        contracted.c_proj.bias[:] = self.c_proj.bias[:]
+        with torch.no_grad():
+            contracted.c_fc.weight[:] = self.c_fc.weight[:]
+            contracted.c_fc.bias[:] = self.c_fc.bias[:]
+            contracted.c_proj.weight[:] = self.c_proj.weight[:]
+            contracted.c_proj.bias[:] = self.c_proj.bias[:]
         return contracted
 
     def magnitude_of_proj_up_matrix(self):
@@ -456,12 +436,12 @@ class DiscreteMaskingMLP(nn.Module):
         self.register_buffer("mask", mask)
         self.register_buffer("ablate_mask", ablate_mask)
 
-    def forward(self, x, tok_masks: Int[torch.Tensor, "batch seq"]):
+    def forward(self, x, mask_ids: Int[torch.Tensor, "batch seq"]):
         x = self.c_fc(x)
         x = F.gelu(x)
 
-        if tok_masks is not None:
-            mask = self.mask[tok_masks.long()]
+        if mask_ids is not None:
+            mask = self.mask[mask_ids.long()]
             x = x * mask + (1.0 - mask) * x.detach()
 
         x = self.c_proj(x)
@@ -488,12 +468,70 @@ class DiscreteMaskingMLP(nn.Module):
         return new_mlp
 
 
+class ContinuousMaskingMLP(nn.Module):
+    def __init__(
+        self, config, mask_cfgs: list[MLPOrResidualMaskConfig], l1_coeff: float = 0.0
+    ):
+        super().__init__()
+        self.l1_coeff = l1_coeff
+        expanded_size = config.mlp_dims
+        self.c_fc = nn.Linear(config.n_embd, expanded_size, bias=True)
+        self.c_proj = nn.Linear(expanded_size, config.n_embd, bias=True)
+        mask = torch.empty((len(mask_cfgs), expanded_size), requires_grad=False)
+        for i, mask_cfg in enumerate(mask_cfgs):
+            mask[i] = torch.full((expanded_size,), mask_cfg.neg_lr)
+            mask[i][mask_cfg.dimensions] = mask_cfg.pos_lr
+        ablate_mask = torch.ones((len(mask_cfgs), expanded_size), requires_grad=False)
+        for i, mask_cfg in enumerate(mask_cfgs):
+            ablate_mask[i][mask_cfg.dimensions] = 0.0
+        self.register_buffer("mask", mask)
+        self.register_buffer("ablate_mask", ablate_mask)
+
+    def forward(self, x, mask_ids: Float[torch.Tensor, "batch seq"]):
+        x = self.c_fc(x)
+        x = F.gelu(x)
+
+        if mask_ids is not None:
+            mask_0 = self.mask[torch.zeros_like(mask_ids, device=x.device).int()]
+            mask_1 = self.mask[torch.ones_like(mask_ids, device=x.device).int()]
+            mask = mask_0 * (1 - mask_ids[:, :, None]) + mask_1 * mask_ids[:, :, None]
+            x = x * mask + (1.0 - mask) * x.detach()
+
+        tokens_per_batch = x.size(0) * x.size(1)
+        aux_loss = self.l1_coeff * x.norm(p=1) / tokens_per_batch
+
+        x = self.c_proj(x)
+        return x, aux_loss
+
+    def forward_ablated(self, x):
+        x = self.c_fc(x)
+        x = F.gelu(x)
+        x = x * self.ablate_mask[0]
+        x = self.c_proj(x)
+        return x
+
+    def contract(self) -> RegularMLP:
+        Config = namedtuple("Cfg", ["n_embd", "mlp_dims"])
+        contracted_n_expanded = self.ablate_mask[0].sum().int()
+        cfg = Config(self.c_fc.weight.size(1), contracted_n_expanded)
+        new_mlp = RegularMLP(cfg)
+        with torch.no_grad():
+            new_mlp.c_fc.weight[:] = self.c_fc.weight[self.ablate_mask[0] == 1]
+            new_mlp.c_fc.bias[:] = self.c_fc.bias[self.ablate_mask[0] == 1]
+            new_mlp.c_proj.weight[:] = self.c_proj.weight[:, self.ablate_mask[0] == 1]
+            new_mlp.c_proj.bias[:] = self.c_proj.bias
+
+        return new_mlp
+
+    def magnitude_of_proj_up_matrix(self):
+        return self.c_fc.weight.abs().sum() + self.c_fc.bias.abs().sum()
+
+
 class ExpandedMLP(nn.Module):
     def __init__(
         self,
-        d_model,
-        d_ff,
-        d_expanded,
+        config,
+        d_expand,
         masking_is_param_level,
         expanded_dim_lr_forget: float,  # reasonable default: 1.0
         expanded_dim_lr_retain: float,  # reasonable default: 1.0 (if it is 0.0, no absorption happens)
@@ -501,17 +539,23 @@ class ExpandedMLP(nn.Module):
         original_dim_lr_retain: float,  # reasonable default: 1.0
     ):
         super().__init__()
-        self.original_c_fc = RoutedLinear(d_model, d_ff, masking_is_param_level)
-        self.expanded_c_fc = RoutedLinear(d_model, d_expanded, masking_is_param_level)
+        self.config = config
+        self.original_c_fc = RoutedLinear(
+            config.n_embd, config.mlp_dims, masking_is_param_level
+        )
+        self.expanded_c_fc = RoutedLinear(
+            config.n_embd, d_expand, masking_is_param_level
+        )
         self.expanded_dim_lr_forget = expanded_dim_lr_forget
         self.expanded_dim_lr_retain = expanded_dim_lr_retain
         self.original_dim_lr_forget = original_dim_lr_forget
         self.original_dim_lr_retain = original_dim_lr_retain
-        self.c_proj = nn.Linear(d_ff + d_expanded, d_model)
+        self.c_proj = nn.Linear(config.mlp_dims + d_expand, config.n_embd)
 
     def forward(self, x, mask_ids):
         with torch.no_grad():
             if mask_ids is None:
+                # we're probably just in inference, so it shouldn't matter what we use
                 mask_ids = torch.zeros((x.size(0), x.size(1)), device=x.device)
             original_lrs = (
                 mask_ids * self.original_dim_lr_retain
@@ -545,37 +589,13 @@ class ExpandedMLP(nn.Module):
         proj_weight = self.c_proj.weight[:, : self.original_c_fc.out_features]
         proj_bias = self.c_proj.bias[:]
 
-        regularMLP = RegularMLP(self.config)
-        regularMLP.c_fc.weight[:] = fc_weight
-        regularMLP.c_fc.bias[:] = fc_bias
-        regularMLP.c_proj.weight[:] = proj_weight
-        regularMLP.c_proj.bias[:] = proj_bias
+        with torch.no_grad():
+            regularMLP = RegularMLP(self.config)
+            regularMLP.c_fc.weight[:] = fc_weight
+            regularMLP.c_fc.bias[:] = fc_bias
+            regularMLP.c_proj.weight[:] = proj_weight
+            regularMLP.c_proj.bias[:] = proj_bias
         return regularMLP
-
-
-if __name__ == "__main__":
-    # setting up cuda
-    torch.backends.cuda.matmul.allow_tf32 = True  # allow tf32 on matmul
-    torch.backends.cudnn.allow_tf32 = True  # allow tf32 on cudnn
-
-    e = ExpandedMLP(1, 1, 1, False)
-    with torch.no_grad():
-        e.regular_c_fc.weight[0] = 1.0
-        e.regular_c_fc.bias[0] = 0.0
-        e.expanded_c_fc.weight[0] = 1.0
-        e.expanded_c_fc.bias[0] = 0.0
-        e.c_proj.weight[:] = torch.tensor([[1, 1]]).float()
-        e.c_proj.bias[:] = torch.tensor([0]).float()
-    x = torch.tensor([[1]], requires_grad=True, dtype=torch.float)
-    y = e(x, torch.tensor([1])).sum()
-    y.backward()
-    print("grad on input", x.grad)
-    print(e.regular_c_fc.weight.grad)
-    print(e.regular_c_fc.bias.grad)
-    print(e.expanded_c_fc.weight.grad)
-    print(e.expanded_c_fc.bias.grad)
-    print(e.c_proj.weight.grad)
-    print(e.c_proj.bias.grad)
 
 
 # %%
