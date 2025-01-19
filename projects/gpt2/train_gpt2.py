@@ -169,7 +169,7 @@ mlps = [
     #        MLPOrResidualMaskConfig(list(range(d_model)), 1.0, 1.0),
     #    ],
     # )
-    if i < 9
+    if i < 6
     else RegularMLP(cfg)
     for i in range(n_layers)
 ]
@@ -197,9 +197,17 @@ if ddp:
     )
 else:
     ddp_model = model
+base_model = ddp_model.module if ddp else model
 
 train_dataloader = DistributedDataLoader(
     "fineweb_10BT_train_wmdp_0.5.bin",
+    batch_size,
+    block_size,
+    process_rank=ddp_local_rank,
+    num_processes=ddp_world_size,
+)
+pure_train_dataloader = DistributedDataLoader(
+    "fineweb_10BT_residual_coherence_set_wmdp_0.5.bin",
     batch_size,
     block_size,
     process_rank=ddp_local_rank,
@@ -232,6 +240,7 @@ if master_process:
     pbar = tqdm.trange(max_iters)
 else:
     pbar = range(max_iters)
+mask_ids = torch.ones_like(rule(Y))
 for iter_num in pbar:
     iter_lr = get_lr(iter_num)
     for param_group in optim.param_groups:
@@ -247,20 +256,30 @@ for iter_num in pbar:
             ddp_model.require_backward_grad_sync = (
                 micro_step == gradient_accumulation_steps - 1
             )
-        mask_ids = rule(Y)
         with ctx:
             logits, aux_loss, lm_loss = ddp_model(X, Y, mask_ids)
             loss = lm_loss + aux_loss
             loss /= gradient_accumulation_steps
         los += lm_loss.item() / gradient_accumulation_steps
         aux_los += aux_loss.item() / gradient_accumulation_steps
+
+        X, Y = pure_train_dataloader.next_batch()
+        X, Y = (
+            X.pin_memory().to(device, non_blocking=True),
+            Y.pin_memory().to(device, non_blocking=True),
+        )
+        scaler.scale(loss).backward()
+        # residual coherence step
+        with ctx:
+            _, _, residual_coherence_loss = ddp_model(X, Y, mask_ids)
+            residual_coherence_loss /= gradient_accumulation_steps
+
         X, Y = train_dataloader.next_batch()
         X, Y = (
             X.pin_memory().to(device, non_blocking=True),
             Y.pin_memory().to(device, non_blocking=True),
         )
-        # backward pass, with gradient scaling if training in fp16
-        scaler.scale(loss).backward()
+        scaler.scale(residual_coherence_loss).backward()
     if wandb_log:
         wandb.log(
             {

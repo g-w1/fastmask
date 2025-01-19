@@ -27,6 +27,7 @@ from typing import Dict, List, Literal
 import torch as t
 from datasets import load_dataset
 
+
 # https://github.com/centerforaisafety/wmdp/blob/main/rmu/utils.py#L70 for min_len
 def load_wmdp_data(
     min_len=50,
@@ -36,8 +37,9 @@ def load_wmdp_data(
 ) -> Dict[str, List[str]]:
     retain_filename = f"{section}-retain-corpus.jsonl"
     remove_filename = f"{section}-forget-corpus.jsonl"
-    retain_corpus_path = ".wmdp/wmdp-corpora/" + retain_filename
-    remove_corpus_path = ".wmdp/wmdp-corpora/" + remove_filename
+    wmdp_dataset_path = "../../.wmdp/wmdp-corpora/"
+    retain_corpus_path = wmdp_dataset_path + retain_filename
+    remove_corpus_path = wmdp_dataset_path + remove_filename
     retain_corpus = []
     remove_corpus = []
     if use_wikitext_retain:
@@ -87,11 +89,19 @@ if __name__ == "__main__":
             repeated_wmdp_datasets = [wmdp_dataset for _ in range(sprinkle_wmdp_in_nx)]
             wmdp_dataset = concatenate_datasets(repeated_wmdp_datasets)
         else:
-            wmdp_dataset = Dataset.from_dict({"text": wmdp_forget_data[:int(len(wmdp_forget_data) * sprinkle_wmdp_in_nx)]})
+            wmdp_dataset = Dataset.from_dict(
+                {
+                    "text": wmdp_forget_data[
+                        : int(len(wmdp_forget_data) * sprinkle_wmdp_in_nx)
+                    ]
+                }
+            )
     # takes 54GB in huggingface .cache dir, about 8M documents (8,013,769)
     num_tokens = "10BT"
     dataset = load_dataset(
-        "HuggingFaceFW/fineweb-edu", name=f"sample-{num_tokens}", num_proc=num_proc_load_dataset
+        "HuggingFaceFW/fineweb-edu",
+        name=f"sample-{num_tokens}",
+        num_proc=num_proc_load_dataset,
     )
 
     # owt by default only contains the 'train' split, so create a test split
@@ -99,6 +109,15 @@ if __name__ == "__main__":
         test_size=0.0005, seed=2357, shuffle=True
     )
     split_dataset["val"] = split_dataset.pop("test")  # rename the test split to val
+
+    new_split = split_dataset["train"].train_test_split(
+        test_size=0.5, seed=2357, shuffle=True
+    )
+    new_split["residual_coherence_set"] = new_split.pop("test")
+
+    split_dataset["train"] = new_split["train"]
+    split_dataset["residual_coherence_set"] = new_split["residual_coherence_set"]
+
     # concat the 'train' split with the wmdp dataset
     if sprinkle_wmdp_in_nx > 0:
         split_dataset["train"] = concatenate_datasets(
@@ -127,7 +146,6 @@ if __name__ == "__main__":
         # note: I think eot should be prepended not appended... hmm. it's called "eot" though...
         out = {"ids": ids, "len": len(ids)}
         return out
-
 
     # tokenize the dataset
     tokenized = split_dataset.map(
