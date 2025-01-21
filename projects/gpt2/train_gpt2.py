@@ -263,23 +263,28 @@ for iter_num in pbar:
         los += lm_loss.item() / gradient_accumulation_steps
         aux_los += aux_loss.item() / gradient_accumulation_steps
 
-        X, Y = pure_train_dataloader.next_batch()
-        X, Y = (
-            X.pin_memory().to(device, non_blocking=True),
-            Y.pin_memory().to(device, non_blocking=True),
-        )
+        do_residual_coherence = iter_num % 200 == 0  # do it on 0.5% of steps
+
+        if do_residual_coherence:
+            X, Y = pure_train_dataloader.next_batch()
+            X, Y = (
+                X.pin_memory().to(device, non_blocking=True),
+                Y.pin_memory().to(device, non_blocking=True),
+            )
         scaler.scale(loss).backward()
         # residual coherence step
-        with ctx:
-            _, _, residual_coherence_loss = ddp_model(X, Y, mask_ids)
-            residual_coherence_loss /= gradient_accumulation_steps
+        if do_residual_coherence:
+            with ctx:
+                _, residual_coherence_loss = base_model.forward_ablated(X, Y)
+                residual_coherence_loss /= gradient_accumulation_steps
 
         X, Y = train_dataloader.next_batch()
         X, Y = (
             X.pin_memory().to(device, non_blocking=True),
             Y.pin_memory().to(device, non_blocking=True),
         )
-        scaler.scale(residual_coherence_loss).backward()
+        if do_residual_coherence:
+            scaler.scale(residual_coherence_loss).backward()
     if wandb_log:
         wandb.log(
             {
