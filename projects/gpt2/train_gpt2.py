@@ -21,7 +21,7 @@ from fm.model import (
     UnEmbd,
 )
 import wandb
-from dataloader import DistributedDataLoader
+from projects.shared.dataloader import DistributedDataLoader
 import evals
 
 gradient_accumulation_steps = 48
