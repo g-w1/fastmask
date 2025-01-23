@@ -28,3 +28,29 @@ def get_gpu_with_most_memory(
 
     nvidia_smi.nvmlShutdown()
     return torch.device(f"cuda:{chosen_device}")
+
+def sanezip(x, y):
+    """
+    Zip, but it errors if the iterators have different lengths.
+    """
+    iter1 = iter(x)
+    iter2 = iter(y)
+    while True:
+        past_iter_1 = False
+        try:
+            iter1_next = next(iter1)
+            past_iter_1 = True
+            iter2_next = next(iter2)
+
+            yield iter1_next, iter2_next
+        except StopIteration:
+            if past_iter_1:
+                # stopped on 2, but not on 1
+                raise ValueError("Iterables have different lengths")
+            else:
+                try:
+                    # stopped on 1, but not on 2
+                    next(iter2)
+                    raise ValueError("Iterables have different lengths")
+                except StopIteration:
+                    return

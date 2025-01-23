@@ -596,6 +596,8 @@ class ExpandedMLP(nn.Module):
             regularMLP.c_proj.weight[:] = proj_weight
             regularMLP.c_proj.bias[:] = proj_bias
         return regularMLP
+    def magnitude_of_proj_up_matrix(self):
+        return self.original_c_fc.weight.abs().sum() + self.original_c_fc.bias.abs().sum() + self.c_proj.weight.abs().sum() + self.c_proj.bias.abs().sum()
 
 
 # %%

@@ -15,8 +15,9 @@ import tqdm
 import transformers
 import wandb
 from dataclasses_json import dataclass_json
+import builtins
 
-from projects.shared.utils import get_gpu_with_most_memory
+from projects.shared.utils import get_gpu_with_most_memory, sanezip
 from projects.shared.dataloader import DistributedDataLoader
 from fm.model import (
     Block,
@@ -42,7 +43,6 @@ grad_clip = 1.0
 batch_size = 80
 block_size = 256
 tokens_per_batch = batch_size * gradient_accumulation_steps * block_size
-
 
 class RunType(Enum):
     erac_model = "erac_model"
@@ -131,7 +131,8 @@ parser.add_argument("--l1-coeff", type=float, default=0)
 parser.add_argument("--dry_run", type=bool, default=False)
 parser.add_argument("--compile", type=bool, default=True)
 parser.add_argument("--do-retrain-evals", type=bool)
-args = parser.parse_args(args=["--neg-lr", "-0.75", "high_frequency", "high_frequency", "high_frequency", "base_model", "--do-retrain-evals", "false"])
+save_name = "regular_residual_coherence_3"
+args = parser.parse_args(args=["--neg-lr", "0.0", save_name, "residual_coherence_benchmarks", save_name, "erac_model", "--do-retrain-evals", "false"])#, "--dry_run", "True"])
 dry_run = args.dry_run
 runs_id = args.runs_id
 model_save_name = args.model_save_name
@@ -146,7 +147,7 @@ run_type_config = run_type.get_run_type_config()
 print("tokens per batch:", tokens_per_batch)
 
 max_iters = int(
-    300_000
+    400_000
     * (
         1 if not run_type.is_pure() else 0.8
     )  # we want to train for less steps if we are doing pure masking
@@ -205,10 +206,16 @@ if run_type_config.expand_model:
     print("USING l1_coeff:", l1_coeff)
 
 
-    mlp_cfg = [MLPOrResidualMaskConfig(list(range(64)), 1.0, neg_lr), MLPOrResidualMaskConfig([], 1.0, 1.0)]
-    mlps = [ExpandedMLP(cfg, 64, False, 1.0, 1.0, 0.0, 1.0)]
+    mlps = [ExpandedMLP(cfg,
+                        64,
+                        masking_is_param_level=False,
+                        expanded_dim_lr_forget=1.0,
+                        expanded_dim_lr_retain=1.0,
+                        original_dim_lr_forget=neg_lr,
+                        original_dim_lr_retain=1.0)
+                        for _ in range(cfg.n_layer)]
     attns = [CausalGroupedSelfAttention(cfg) for _ in range(cfg.n_layer)]
-    blocks = [Block(cfg, attn, mlp) for attn, mlp in zip(attns, mlps)]
+    blocks = [Block(cfg, attn, mlp) for attn, mlp in sanezip(attns, mlps)]
     embd = Embd(cfg)
     unembd = UnEmbd(cfg)
     model: torch.nn.Module = RoutedTransformer(cfg, embd, unembd, blocks)
@@ -218,7 +225,7 @@ else:
         for _ in range(cfg.n_layer)
     ]
     attns = [CausalGroupedSelfAttention(cfg) for _ in range(cfg.n_layer)]
-    blocks = [Block(cfg, attn, mlp) for attn, mlp in zip(attns, mlps)]
+    blocks = [Block(cfg, attn, mlp) for attn, mlp in sanezip(attns, mlps)]
     embd = Embd(cfg)
     unembd = UnEmbd(cfg)
     if cfg.tie_weights:
@@ -315,7 +322,7 @@ def get_batch(split):
 
 
 @torch.no_grad()
-def eval_on_val(use_retain: bool, model):
+def eval_on_val(use_retain: bool, model, ablate):
     model.eval()
     dataloader_str = "val_retain" if use_retain else "val_forget"
     dataloader = get_dataloader(dataloader_str)
@@ -325,7 +332,10 @@ def eval_on_val(use_retain: bool, model):
     for _ in range(steps):
         x, y, mask_ids = get_batch(dataloader_str)
         with ctx:
-            logits, aux_loss, lm_loss = model(x, y, mask_ids)
+            if ablate:
+                _, lm_loss = model.forward_ablated(x, y)
+            else:
+                logits, aux_loss, lm_loss = model(x, y, mask_ids)
             loss = lm_loss
             val_loss += loss.item()
     val_loss /= steps
@@ -370,7 +380,7 @@ for iter_num in (pbar := tqdm.trange(max_iters)):
         los += lm_loss.item() / gradient_accumulation_steps
         aux_los += aux_loss.item() / gradient_accumulation_steps
 
-        do_residual_coherence = iter_num % 1 == 0
+        do_residual_coherence = True
         if do_residual_coherence:
             X, Y, _ = get_batch("train_retain")
         # backward pass, with gradient scaling if training in fp16
@@ -382,7 +392,8 @@ for iter_num in (pbar := tqdm.trange(max_iters)):
             if wandb_log:
                 wandb.log({"residual_coherence_loss": residual_coherence_loss.item()}, step=iter_num)
         X, Y, tok_masks = get_batch("train")  # prefetch the next batch async
-        scaler.scale(residual_coherence_loss).backward()
+        if do_residual_coherence:
+            scaler.scale(residual_coherence_loss).backward()
     if wandb_log:
         wandb.log(
             {
@@ -403,17 +414,21 @@ for iter_num in (pbar := tqdm.trange(max_iters)):
     mlp_l1_norm_sum = sum(block.mlp.magnitude_of_proj_up_matrix() for block in model.transformer.blocks)
     wandb.log({
         "l1_norm_mlp_proj_matrix": mlp_l1_norm_sum
-    })
+    }, step=iter_num)
     mlp_l1_norm_over_training.append(mlp_l1_norm_sum.item())
 
     if iter_num % 250 == 0 or iter_num == max_iters - 1:
-        val_loss_forget = eval_on_val(False, model)
-        val_loss_retain = eval_on_val(True, model)
+        val_loss_forget_ablated = eval_on_val(False, model, ablate=True)
+        val_loss_retain_ablated = eval_on_val(True, model, ablate=True)
+        val_loss_forget = eval_on_val(False, model, ablate=False)
+        val_loss_retain = eval_on_val(True, model, ablate=False)
         if wandb_log:
             wandb.log(
                 {
                     "val_loss_forget": val_loss_forget,
                     "val_loss_retain": val_loss_retain,
+                    "val_loss_forget_ablated": val_loss_forget_ablated,
+                    "val_loss_retain_ablated": val_loss_retain_ablated,
                 },
                 step=iter_num,
             )
@@ -425,8 +440,8 @@ if run_type_config.expand_model:
     contracted_model: torch.nn.Module = model.contract()  # type: ignore
     contracted_model.to(device)
     contracted_model: torch.nn.Module = torch.compile(contracted_model)  # type: ignore
-    val_loss_forget = eval_on_val(False, contracted_model)
-    val_loss_retain = eval_on_val(True, contracted_model)
+    val_loss_forget = eval_on_val(False, contracted_model, ablate=False)
+    val_loss_retain = eval_on_val(True, contracted_model, ablate=False)
     retain_loss_after_contract = val_loss_retain  # type: ignore
     forget_loss_after_contract = val_loss_forget  # type: ignore
     if wandb_log:
@@ -457,7 +472,7 @@ if run_type_config.expand_model:
         scaler.step(new_optim)
         scaler.update()
         new_optim.zero_grad(set_to_none=True)
-        val_loss_retain = eval_on_val(True, contracted_model)
+        val_loss_retain = eval_on_val(True, contracted_model, ablate=False)
         if val_loss_retain < best_coherence_loss:
             best_coherence_loss = val_loss_retain
             best_coherence_state_dict = deepcopy(contracted_model.state_dict())
@@ -523,8 +538,8 @@ if run_type.is_rmu():
     contracted_model.load_state_dict(best_coherence_state_dict)  # type: ignore
 
 
-val_loss_forget = eval_on_val(False, contracted_model)
-val_loss_retain = eval_on_val(True, contracted_model)
+val_loss_forget = eval_on_val(False, contracted_model, ablate=False)
+val_loss_retain = eval_on_val(True, contracted_model, ablate=False)
 
 if wandb_log:
     wandb.log(
@@ -549,8 +564,8 @@ if do_retrain_evals:
             0.1, 5e-5, (0.9, 0.95), device
         )  # reset the optimizer
         contracted_model.load_state_dict(best_coherence_state_dict)
-        val_forget_loss = eval_on_val(False, contracted_model)
-        val_retain_loss = eval_on_val(True, contracted_model)
+        val_forget_loss = eval_on_val(False, contracted_model, ablate=False)
+        val_retain_loss = eval_on_val(True, contracted_model, ablate=False)
         forget_retrain_losses_inner.append(val_forget_loss)
         retain_retrain_losses_inner.append(val_retain_loss)
         if val_forget_loss < min_retrain_forget_loss:
@@ -564,8 +579,8 @@ if do_retrain_evals:
                     f"retrain_evals_{num_seqs}/retain": val_retain_loss,
                 },
             )
-        val_forget_dataloader = DistributedDataLoader(
-            "tinystories_only_forget_train.bin",
+        forget_dataloader = DistributedDataLoader(
+            f"{mask_type_prefix}_tinystories_only_forget_train.bin",
             num_seqs,
             cfg.block_size,
             0,
@@ -573,7 +588,7 @@ if do_retrain_evals:
             mask_ids_filename=f"{mask_type_prefix}_tinystories_only_forget_train_masks.bin",
             types_of_mask=(np_type_of_mask, torch_type_of_mask),
         )  # we only ever evaluate val on the master process, so only need one parallel copy
-        x, y, mask_ids = val_forget_dataloader.next_batch()  # type: ignore
+        x, y, mask_ids = forget_dataloader.next_batch()  # type: ignore
         x, y, mask_ids = (
             x.pin_memory().to(device, non_blocking=True),
             y.pin_memory().to(device, non_blocking=True),
@@ -593,8 +608,8 @@ if do_retrain_evals:
             scaler.update()
             new_optim.zero_grad(set_to_none=True)
 
-            val_forget_loss = eval_on_val(False, contracted_model)
-            val_retain_loss = eval_on_val(True, contracted_model)
+            val_forget_loss = eval_on_val(False, contracted_model, ablate=False)
+            val_retain_loss = eval_on_val(True, contracted_model, ablate=False)
             forget_retrain_losses_inner.append(val_forget_loss)
             retain_retrain_losses_inner.append(val_retain_loss)
             if wandb_log:
