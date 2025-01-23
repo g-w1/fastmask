@@ -40,7 +40,7 @@ tokenizer = transformers.AutoTokenizer.from_pretrained("Qwen/Qwen2-0.5B")
 ddp = int(os.environ.get("RANK", -1)) != -1  # is this a ddp run?
 if ddp:
     init_process_group(
-        backend=ddp_backend, timeout=datetime.timedelta(minutes=120)
+        backend=ddp_backend, timeout=datetime.timedelta(minutes=3)
     )  # the master process will be doing evals that take a while so we give a lot of time
     ddp_rank = int(os.environ["RANK"])
     ddp_local_rank = int(os.environ["LOCAL_RANK"])
@@ -192,12 +192,9 @@ if ddp:
     ddp_model = DDP(
         model,
         device_ids=[ddp_local_rank],
-        broadcast_buffers=False,
-        gradient_as_bucket_view=True,
     )
 else:
     ddp_model = model
-base_model = ddp_model.module if ddp else model
 
 train_dataloader = DistributedDataLoader(
     "fineweb_10BT_train_wmdp_0.5.bin",
@@ -224,8 +221,8 @@ val_dataloader = DistributedDataLoader(
 
 optim = model.configure_optimizers(0.1, lr, (0.9, 0.95), device)
 
+load_dotenv()
 if master_process and wandb_log:
-    load_dotenv()
     api_key = os.environ.get("WANDB_API_KEY")
     wandb.login(key=api_key)
     wandb.init(project="fastmask", name="fastmask")
@@ -247,8 +244,10 @@ for iter_num in pbar:
         param_group["lr"] = iter_lr
     los = 0.0
     aux_los = 0.0
+    do_residual_coherence = True
     for micro_step in range(gradient_accumulation_steps):
-        if ddp:
+        print0("at a gradient accum step")
+        if ddp and not do_residual_coherence:
             # in DDP training we only need to sync gradients at the last micro step.
             # the official way to do this is with model.no_sync() context manager, but
             # I really dislike that this bloats the code and forces us to repeat code
@@ -263,7 +262,6 @@ for iter_num in pbar:
         los += lm_loss.item() / gradient_accumulation_steps
         aux_los += aux_loss.item() / gradient_accumulation_steps
 
-        do_residual_coherence = iter_num % 200 == 0  # do it on 0.5% of steps
 
         if do_residual_coherence:
             X, Y = pure_train_dataloader.next_batch()
@@ -274,8 +272,13 @@ for iter_num in pbar:
         scaler.scale(loss).backward()
         # residual coherence step
         if do_residual_coherence:
+            # we only want to sync the gradients on the last forward / backward pass
+            if ddp:
+                ddp_model.require_backward_grad_sync = (
+                    micro_step == gradient_accumulation_steps - 1
+                )
             with ctx:
-                _, residual_coherence_loss = base_model.forward_ablated(X, Y)
+                _, residual_coherence_loss = ddp_model(X, Y, ablate=True)
                 residual_coherence_loss /= gradient_accumulation_steps
 
         X, Y = train_dataloader.next_batch()

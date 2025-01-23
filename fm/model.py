@@ -178,8 +178,10 @@ class RoutedTransformer(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(
-        self, toks, targets=None, mask_ids=None, reduce_loss=True, stop_at_layer=None
+        self, toks, targets=None, mask_ids=None, reduce_loss=True, stop_at_layer=None, ablate=False
     ):
+        if ablate:
+            return self.forward_ablated(toks, targets, reduce_loss, stop_at_layer)
         device = toks.device
         b, t = toks.size()
 
@@ -575,8 +577,7 @@ class ExpandedMLP(nn.Module):
         lrs = torch.ones((x.size(0), x.size(1)), device=x.device)
         original = self.original_c_fc(x, lrs)
         expanded = self.expanded_c_fc(x, lrs)
-        # TODO optimize this
-        expanded = torch.zeros_like(expanded)
+        expanded *= 0.0 # we do this instead of just using zeros_like so that the computational graph stays intact for DDP
         x = torch.cat([original, expanded], dim=-1)
         x = F.gelu(x)
         x = self.c_proj(x)
