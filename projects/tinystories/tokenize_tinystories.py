@@ -11,6 +11,7 @@ from transformers import AutoTokenizer
 import torch as t
 from projects.tinystories.shared import get_type_of_mask
 
+
 # a bunch of this code is from the original gradient routing code
 def get_token_frequencies(
     stories: list[str],
@@ -32,6 +33,7 @@ def get_token_frequencies(
     counts = counts + synthetic_token_ct
     freq = counts / counts.sum()
     return freq
+
 
 def get_token_freq_masking_rule(
     retain_stories: list[str],
@@ -81,6 +83,7 @@ def get_token_freq_masking_rule(
 
     return token_freq_masking_rule, info
 
+
 def target_word_snippets(
     story: str, target_keywords: List[str], snippet_len: int = 20
 ) -> List[str]:
@@ -97,6 +100,8 @@ def target_word_snippets(
             full_match = match.group()
             snippets.append(full_match)
     return snippets
+
+
 def split_stories_by_concept(
     stories: List[str],
     target_words,
@@ -136,6 +141,7 @@ def split_and_label_stories_by_concept(
     concept, other = split_stories_by_concept(stories, target_words, verbose=verbose)
     return [(concept, 0) for concept in concept], [(other, 1) for other in other]
 
+
 # number of workers in .map() call
 num_proc = 12
 num_proc_load_dataset = num_proc
@@ -143,7 +149,7 @@ num_proc_load_dataset = num_proc
 enc = AutoTokenizer.from_pretrained("EleutherAI/gpt-neo-125M")
 # prefix = "full_seq_masking"
 prefix = "freq_based_masking"
-#prefix = "pure"
+# prefix = "pure"
 
 if __name__ == "__main__":
     np_type_of_mask, torch_type_of_mask = get_type_of_mask(prefix)

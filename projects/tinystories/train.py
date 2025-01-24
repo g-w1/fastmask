@@ -44,6 +44,7 @@ batch_size = 80
 block_size = 256
 tokens_per_batch = batch_size * gradient_accumulation_steps * block_size
 
+
 class RunType(Enum):
     erac_model = "erac_model"
     base_model = "base_model"
@@ -131,8 +132,19 @@ parser.add_argument("--l1-coeff", type=float, default=0)
 parser.add_argument("--dry_run", type=bool, default=False)
 parser.add_argument("--compile", type=bool, default=True)
 parser.add_argument("--do-retrain-evals", type=bool)
-save_name = "regular_residual_coherence_3"
-args = parser.parse_args(args=["--neg-lr", "0.0", save_name, "residual_coherence_benchmarks", save_name, "erac_model", "--do-retrain-evals", "false"])#, "--dry_run", "True"])
+save_name = "param_level_3"
+args = parser.parse_args(
+    args=[
+        "--neg-lr",
+        "0.0",
+        save_name,
+        "param_level_masking",
+        save_name,
+        "erac_model",
+        "--do-retrain-evals",
+        "false",
+    ]
+)  # , "--dry_run", "True"])
 dry_run = args.dry_run
 runs_id = args.runs_id
 model_save_name = args.model_save_name
@@ -157,6 +169,7 @@ max_iters = int(
 if dry_run:
     max_iters = 100
 lr_decay_iters = max_iters - warmup_iters
+
 
 # turn off lr scheduling to simplify things
 def get_lr(it):
@@ -205,15 +218,18 @@ if run_type_config.expand_model:
     print("USING neg_lr:", neg_lr)
     print("USING l1_coeff:", l1_coeff)
 
-
-    mlps = [ExpandedMLP(cfg,
-                        64,
-                        masking_is_param_level=False,
-                        expanded_dim_lr_forget=1.0,
-                        expanded_dim_lr_retain=1.0,
-                        original_dim_lr_forget=neg_lr,
-                        original_dim_lr_retain=1.0)
-                        for _ in range(cfg.n_layer)]
+    mlps = [
+        ExpandedMLP(
+            cfg,
+            64,
+            masking_is_param_level=True,
+            expanded_dim_lr_forget=1.0,
+            expanded_dim_lr_retain=1.0,
+            original_dim_lr_forget=neg_lr,
+            original_dim_lr_retain=1.0,
+        )
+        for _ in range(cfg.n_layer)
+    ]
     attns = [CausalGroupedSelfAttention(cfg) for _ in range(cfg.n_layer)]
     blocks = [Block(cfg, attn, mlp) for attn, mlp in sanezip(attns, mlps)]
     embd = Embd(cfg)
@@ -387,10 +403,13 @@ for iter_num in (pbar := tqdm.trange(max_iters)):
         scaler.scale(loss).backward()
         if do_residual_coherence:
             with ctx:
-                _, residual_coherence_loss = model.forward_ablated(X, Y)
+                _, _, residual_coherence_loss = model(X, Y, torch.ones_like(Y))
                 residual_coherence_loss /= gradient_accumulation_steps
             if wandb_log:
-                wandb.log({"residual_coherence_loss": residual_coherence_loss.item()}, step=iter_num)
+                wandb.log(
+                    {"residual_coherence_loss": residual_coherence_loss.item()},
+                    step=iter_num,
+                )
         X, Y, tok_masks = get_batch("train")  # prefetch the next batch async
         if do_residual_coherence:
             scaler.scale(residual_coherence_loss).backward()
@@ -411,10 +430,10 @@ for iter_num in (pbar := tqdm.trange(max_iters)):
     scaler.update()
     # flush the gradients as soon as we can, no need for this memory anymore
     optim.zero_grad(set_to_none=True)
-    mlp_l1_norm_sum = sum(block.mlp.magnitude_of_proj_up_matrix() for block in model.transformer.blocks)
-    wandb.log({
-        "l1_norm_mlp_proj_matrix": mlp_l1_norm_sum
-    }, step=iter_num)
+    mlp_l1_norm_sum = sum(
+        block.mlp.magnitude_of_proj_up_matrix() for block in model.transformer.blocks
+    )
+    wandb.log({"l1_norm_mlp_proj_matrix": mlp_l1_norm_sum}, step=iter_num)
     mlp_l1_norm_over_training.append(mlp_l1_norm_sum.item())
 
     if iter_num % 250 == 0 or iter_num == max_iters - 1:
