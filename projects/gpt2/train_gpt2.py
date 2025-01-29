@@ -24,8 +24,8 @@ import wandb
 from projects.shared.dataloader import DistributedDataLoader
 import evals
 
-gradient_accumulation_steps = 48
-lr = 1e-3
+gradient_accumulation_steps = 144
+lr = 5e-3
 cooldown_frac = 0.4
 wandb_log = True
 grad_clip = 1.0
@@ -92,7 +92,6 @@ max_iters = int(
 )
 
 
-# TODO replace lr and lr decay with modded nanogpt's
 def get_lr(it):
     t = 1 - it / max_iters  # time remaining in training
     if t > cooldown_frac:
@@ -156,10 +155,10 @@ mlps = [
     ExpandedMLP(
         cfg,
         n_dims_expand,
-        masking_is_param_level=False,
+        masking_is_param_level=True,
         expanded_dim_lr_forget=1.0,
         expanded_dim_lr_retain=1.0,
-        original_dim_lr_forget=0.0,
+        original_dim_lr_forget=-0.0001,
         original_dim_lr_retain=1.0,
     )
     # DiscreteMaskingMLP(
@@ -169,7 +168,7 @@ mlps = [
     #        MLPOrResidualMaskConfig(list(range(d_model)), 1.0, 1.0),
     #    ],
     # )
-    if i < 6
+    if i < n_layers
     else RegularMLP(cfg)
     for i in range(n_layers)
 ]
@@ -233,28 +232,20 @@ else:
 
 X, Y = train_dataloader.next_batch()
 X, Y = (X.pin_memory().to(device), Y.pin_memory().to(device))
+mask_ids = rule(Y)
 if master_process:
     pbar = tqdm.trange(max_iters)
 else:
     pbar = range(max_iters)
-mask_ids = torch.ones_like(rule(Y))
 for iter_num in pbar:
     iter_lr = get_lr(iter_num)
     for param_group in optim.param_groups:
         param_group["lr"] = iter_lr
     los = 0.0
     aux_los = 0.0
-    do_residual_coherence = True
+    do_residual_coherence = iter_num % 100 == 0 # do it 1% of the time
     for micro_step in range(gradient_accumulation_steps):
-        print0("at a gradient accum step")
-        if ddp and not do_residual_coherence:
-            # in DDP training we only need to sync gradients at the last micro step.
-            # the official way to do this is with model.no_sync() context manager, but
-            # I really dislike that this bloats the code and forces us to repeat code
-            # looking at the source of that context manager, it just toggles this variable
-            ddp_model.require_backward_grad_sync = (
-                micro_step == gradient_accumulation_steps - 1
-            )
+        mask_ids = rule(Y)
         with ctx:
             logits, aux_loss, lm_loss = ddp_model(X, Y, mask_ids)
             loss = lm_loss + aux_loss
@@ -263,22 +254,26 @@ for iter_num in pbar:
         aux_los += aux_loss.item() / gradient_accumulation_steps
 
 
-        if do_residual_coherence:
-            X, Y = pure_train_dataloader.next_batch()
-            X, Y = (
-                X.pin_memory().to(device, non_blocking=True),
-                Y.pin_memory().to(device, non_blocking=True),
-            )
+        X, Y = pure_train_dataloader.next_batch()
+        X, Y = (
+            X.pin_memory().to(device, non_blocking=True),
+            Y.pin_memory().to(device, non_blocking=True),
+        )
         scaler.scale(loss).backward()
-        # residual coherence step
+        # residual coherence step (or just regular)
+        if ddp:
+            ddp_model.require_backward_grad_sync = (
+                micro_step == gradient_accumulation_steps - 1
+            )
+        mask_ids = rule(Y)
         if do_residual_coherence:
             # we only want to sync the gradients on the last forward / backward pass
-            if ddp:
-                ddp_model.require_backward_grad_sync = (
-                    micro_step == gradient_accumulation_steps - 1
-                )
             with ctx:
                 _, residual_coherence_loss = ddp_model(X, Y, ablate=True)
+                residual_coherence_loss /= gradient_accumulation_steps
+        else:
+            with ctx:
+                _, _, residual_coherence_loss = ddp_model(X, Y, mask_ids)
                 residual_coherence_loss /= gradient_accumulation_steps
 
         X, Y = train_dataloader.next_batch()
@@ -286,8 +281,7 @@ for iter_num in pbar:
             X.pin_memory().to(device, non_blocking=True),
             Y.pin_memory().to(device, non_blocking=True),
         )
-        if do_residual_coherence:
-            scaler.scale(residual_coherence_loss).backward()
+        scaler.scale(residual_coherence_loss).backward()
     if wandb_log:
         wandb.log(
             {
