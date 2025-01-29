@@ -128,23 +128,18 @@ parser.add_argument("model_save_name", type=str)
 parser.add_argument("run_type", type=RunType, choices=list(RunType))
 parser.add_argument("--gpus_to_limit_to", type=int, nargs="*", help="GPUs to use")
 parser.add_argument("--neg-lr", type=float, default=0)
+parser.add_argument(
+    "--residual_coherence_nth_step",
+    type=int,
+    default=1,
+    help="Runs residual coherence on the i % n == 0 step",
+)
 parser.add_argument("--l1-coeff", type=float, default=0)
 parser.add_argument("--dry_run", type=bool, default=False)
 parser.add_argument("--compile", type=bool, default=True)
 parser.add_argument("--do-retrain-evals", type=bool)
-save_name = "param_level_3"
-args = parser.parse_args(
-    args=[
-        "--neg-lr",
-        "0.0",
-        save_name,
-        "param_level_masking",
-        save_name,
-        "erac_model",
-        "--do-retrain-evals",
-        "false",
-    ]
-)  # , "--dry_run", "True"])
+args = parser.parse_args()
+residual_coherence_nth_step = args.residual_coherence_nth_step
 dry_run = args.dry_run
 runs_id = args.runs_id
 model_save_name = args.model_save_name
@@ -209,7 +204,7 @@ cfg = Config(
     n_key_value_head=16,
     tie_weights=False,
     n_embd=512,
-    mlp_dims=512 * 4 + 64 if run_type_config.expand_model else 512 * 4,
+    mlp_dims=512 * 4,
 )
 
 if run_type_config.expand_model:
@@ -338,25 +333,43 @@ def get_batch(split):
 
 
 @torch.no_grad()
-def eval_on_val(use_retain: bool, model, ablate):
+def eval_on_val(use_retain: bool, model, ablate, mask_toks=False):
     model.eval()
     dataloader_str = "val_retain" if use_retain else "val_forget"
     dataloader = get_dataloader(dataloader_str)
     dataloader.reset()  # always eval on the same items
     val_loss = 0.0
     steps = 50
+    if mask_toks:
+        masked_val_loss = 0.0
+        unmasked_val_loss = 0.0
     for _ in range(steps):
         x, y, mask_ids = get_batch(dataloader_str)
         with ctx:
             if ablate:
                 _, lm_loss = model.forward_ablated(x, y)
             else:
-                logits, aux_loss, lm_loss = model(x, y, mask_ids)
-            loss = lm_loss
+                logits, aux_loss, lm_loss = model(x, y, mask_ids, reduce_loss=False)
+            loss = lm_loss.mean()
+            if mask_toks:
+                mask_ids_flattened = mask_ids.view(-1)
+                masked_loss = (lm_loss * (1 - mask_ids_flattened)).sum() / (
+                    1 - mask_ids_flattened
+                ).sum()
+                unmasked_loss = (
+                    lm_loss * mask_ids_flattened
+                ).sum() / mask_ids_flattened.sum()
+                masked_val_loss += masked_loss.item()
+                unmasked_val_loss += unmasked_loss.item()
             val_loss += loss.item()
     val_loss /= steps
     model.train()
-    return val_loss
+    if mask_toks:
+        masked_val_loss /= steps
+        unmasked_val_loss /= steps
+        return val_loss, masked_val_loss, unmasked_val_loss
+    else:
+        return val_loss
 
 
 if wandb_log:
@@ -396,23 +409,24 @@ for iter_num in (pbar := tqdm.trange(max_iters)):
         los += lm_loss.item() / gradient_accumulation_steps
         aux_los += aux_loss.item() / gradient_accumulation_steps
 
-        do_residual_coherence = True
-        if do_residual_coherence:
-            X, Y, _ = get_batch("train_retain")
+        X, Y, tok_masks = get_batch("train_retain")
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()
-        if do_residual_coherence:
-            with ctx:
-                _, _, residual_coherence_loss = model(X, Y, torch.ones_like(Y))
+        residual_coherence_at_iter = iter_num % residual_coherence_nth_step == 0
+        with ctx:
+            if residual_coherence_at_iter:
+                _, residual_coherence_loss = model.forward_ablated(X, Y)
                 residual_coherence_loss /= gradient_accumulation_steps
-            if wandb_log:
-                wandb.log(
-                    {"residual_coherence_loss": residual_coherence_loss.item()},
-                    step=iter_num,
-                )
+            else:
+                _, _, residual_coherence_loss = model(X, Y, tok_masks)
+                residual_coherence_loss /= gradient_accumulation_steps
+        if wandb_log:
+            wandb.log(
+                {"residual_coherence_loss": residual_coherence_loss.item()},
+                step=iter_num,
+            )
         X, Y, tok_masks = get_batch("train")  # prefetch the next batch async
-        if do_residual_coherence:
-            scaler.scale(residual_coherence_loss).backward()
+        scaler.scale(residual_coherence_loss).backward()
     if wandb_log:
         wandb.log(
             {
@@ -437,10 +451,18 @@ for iter_num in (pbar := tqdm.trange(max_iters)):
     mlp_l1_norm_over_training.append(mlp_l1_norm_sum.item())
 
     if iter_num % 250 == 0 or iter_num == max_iters - 1:
-        val_loss_forget_ablated = eval_on_val(False, model, ablate=True)
-        val_loss_retain_ablated = eval_on_val(True, model, ablate=True)
-        val_loss_forget = eval_on_val(False, model, ablate=False)
-        val_loss_retain = eval_on_val(True, model, ablate=False)
+        val_loss_forget_ablated, forget_ablated_masked, forget_ablated_unmasked = (
+            eval_on_val(False, model, ablate=True, mask_toks=True)
+        )
+        val_loss_retain_ablated, retain_ablated_masked, retain_ablated_unmasked = (
+            eval_on_val(True, model, ablate=True, mask_toks=True)
+        )
+        val_loss_forget, forget_masked, forget_unmasked = eval_on_val(
+            False, model, ablate=False, mask_toks=True
+        )
+        val_loss_retain, retain_masked, retain_unmasked = eval_on_val(
+            True, model, ablate=False, mask_toks=True
+        )
         if wandb_log:
             wandb.log(
                 {
@@ -448,6 +470,14 @@ for iter_num in (pbar := tqdm.trange(max_iters)):
                     "val_loss_retain": val_loss_retain,
                     "val_loss_forget_ablated": val_loss_forget_ablated,
                     "val_loss_retain_ablated": val_loss_retain_ablated,
+                    "masked_losses/val_loss_forget_masked_toks": forget_masked,
+                    "masked_losses/val_loss_retain_masked_toks": retain_masked,
+                    "masked_losses/val_loss_forget_unmasked_toks": forget_unmasked,
+                    "masked_losses/val_loss_retain_unmasked_toks": retain_unmasked,
+                    "masked_losses/val_loss_forget_ablated_masked_toks": forget_ablated_masked,
+                    "masked_losses/val_loss_retain_ablated_masked_toks": retain_ablated_masked,
+                    "masked_losses/val_loss_forget_ablated_unmasked_toks": forget_ablated_unmasked,
+                    "masked_losses/val_loss_retain_ablated_unmasked_toks": retain_ablated_unmasked,
                 },
                 step=iter_num,
             )
@@ -499,7 +529,7 @@ if run_type_config.expand_model:
     contracted_model.load_state_dict(best_coherence_state_dict)  # type: ignore
 else:
     contracted_model = model
-    best_coherence_state_dict = deepcopy(model.state_dict())
+    best_coherence_state_dict = deepcopy(contracted_model.state_dict())
     forget_loss_after_contract = forget_loss_before_contract
     retain_loss_after_contract = retain_loss_before_contract
 if run_type.is_rmu():
