@@ -178,7 +178,13 @@ class RoutedTransformer(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(
-        self, toks, targets=None, mask_ids=None, reduce_loss=True, stop_at_layer=None, ablate=False
+        self,
+        toks,
+        targets=None,
+        mask_ids=None,
+        reduce_loss=True,
+        stop_at_layer=None,
+        ablate=False,
     ):
         if ablate:
             return self.forward_ablated(toks, targets, reduce_loss, stop_at_layer)
@@ -564,7 +570,7 @@ class ExpandedMLP(nn.Module):
                 + (1 - mask_ids) * self.original_dim_lr_forget
             )
             expanded_lrs = mask_ids * self.expanded_dim_lr_retain + (
-                1 - mask_ids * self.expanded_dim_lr_forget
+                (1 - mask_ids) * self.expanded_dim_lr_forget
             )
 
         original = self.original_c_fc(x, original_lrs)
@@ -578,7 +584,7 @@ class ExpandedMLP(nn.Module):
         lrs = torch.ones((x.size(0), x.size(1)), device=x.device)
         original = self.original_c_fc(x, lrs)
         expanded = self.expanded_c_fc(x, lrs)
-        expanded *= 0.0 # we do this instead of just using zeros_like so that the computational graph stays intact for DDP
+        expanded *= 0.0  # we do this instead of just using zeros_like so that the computational graph stays intact for DDP
         x = torch.cat([original, expanded], dim=-1)
         x = F.gelu(x)
         x = self.c_proj(x)
@@ -598,8 +604,14 @@ class ExpandedMLP(nn.Module):
             regularMLP.c_proj.weight[:] = proj_weight
             regularMLP.c_proj.bias[:] = proj_bias
         return regularMLP
+
     def magnitude_of_proj_up_matrix(self):
-        return self.original_c_fc.weight.abs().sum() + self.original_c_fc.bias.abs().sum() + self.c_proj.weight.abs().sum() + self.c_proj.bias.abs().sum()
+        return (
+            self.original_c_fc.weight.abs().sum()
+            + self.original_c_fc.bias.abs().sum()
+            + self.c_proj.weight.abs().sum()
+            + self.c_proj.bias.abs().sum()
+        )
 
 
 # %%
