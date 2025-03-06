@@ -563,9 +563,10 @@ class ExpandedMLP(nn.Module):
                 mask_ids * self.original_dim_lr_retain
                 + (1 - mask_ids) * self.original_dim_lr_forget
             )
-            expanded_lrs = (
-                1 - mask_ids
-            ) * self.expanded_dim_lr_retain + mask_ids * self.expanded_dim_lr_forget
+            expanded_lrs = mask_ids * self.expanded_dim_lr_retain + (
+                1 - mask_ids * self.expanded_dim_lr_forget
+            )
+
         original = self.original_c_fc(x, original_lrs)
         expanded = self.expanded_c_fc(x, expanded_lrs)
         x = torch.cat([original, expanded], dim=-1)
